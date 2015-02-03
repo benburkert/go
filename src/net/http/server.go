@@ -114,13 +114,14 @@ type CloseNotifier interface {
 
 // A conn represents the server side of an HTTP connection.
 type conn struct {
-	remoteAddr string               // network address of remote side
-	server     *Server              // the Server on which the connection arrived
-	rwc        net.Conn             // i/o connection
-	w          io.Writer            // checkConnErrorWriter's copy of wrc, not zeroed on Hijack
-	werr       error                // any errors writing to w
-	sr         liveSwitchReader     // where the LimitReader reads from; usually the rwc
-	lr         *io.LimitedReader    // io.LimitReader(sr)
+	remoteAddr string            // network address of remote side
+	server     *Server           // the Server on which the connection arrived
+	rwc        net.Conn          // i/o connection
+	w          io.Writer         // checkConnErrorWriter's copy of wrc, not zeroed on Hijack
+	werr       error             // any errors writing to w
+	sr         liveSwitchReader  // where the LimitReader reads from; usually the rwc
+	lr         *io.LimitedReader // io.LimitReader(sr)
+	ir         *interruptibleReader
 	buf        *bufio.ReadWriter    // buffered(lr,rwc), reading from bufio->limitReader->sr->rwc
 	tlsState   *tls.ConnectionState // or nil when not using TLS
 
@@ -143,7 +144,11 @@ func (c *conn) hijack() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 		return nil, nil, ErrHijacked
 	}
 	if c.closeNotifyc != nil {
-		return nil, nil, errors.New("http: Hijack is incompatible with use of CloseNotifier")
+		c.ir.interupt() // finish the closeNotify goroutine
+
+		c.sr.Lock()
+		c.sr.r = io.MultiReader(c.sr.r, c.ir.Reader) // read leftover from closeNotify, then original reader
+		c.sr.Unlock()
 	}
 	c.hijackedv = true
 	rwc = c.rwc
@@ -166,7 +171,14 @@ func (c *conn) closeNotify() <-chan bool {
 		}
 		pr, pw := io.Pipe()
 
-		readSource := c.sr.r
+		c.ir := &interruptibleReader{
+			Reader: c.sr.r,
+			readc: make(chan readResult),
+			buf: []byte{},
+		}
+		go c.ir.run()
+
+		readSource := c.ir
 		c.sr.Lock()
 		c.sr.r = pr
 		c.sr.Unlock()
@@ -215,6 +227,88 @@ func (sr *liveSwitchReader) Read(p []byte) (n int, err error) {
 	r := sr.r
 	sr.Unlock()
 	return r.Read(p)
+}
+
+type readResult struct {
+	p   []byte
+	err error
+}
+
+type interruptReader struct {
+	io.Reader
+
+	mu    sync.Mutex
+	intr  bool
+	readc chan readResult
+	buf   []byte
+	err   error
+}
+
+func (ir *interuptReader) Read(p []byte) (n int, err error) {
+	ir.mu.Lock()
+	defer ir.mu.Unlock()
+
+	if len(ir.buf) >= len(p) {
+		copy(p, ir.buf[:len(p)-1]
+		ir.buf = buf[len(p):]
+		return len(p), nil
+	}
+
+	if ir.err != nil {
+		err := ir.err
+		ir.err = nil
+		return 0, err
+	}
+
+	res <-ir.readc
+	ir.buf = append(ir.buf, res.p...)
+	ir.err = res.err
+
+	if len(ir.buf) >= len(p) {
+		copy(p, ir.buf[:len(p)-1]
+		ir.buf = buf[len(p):]
+		return len(p), nil
+	}
+
+	copy(p[:len(ir.buf)-1], ir.buf)
+	buf = []byte{}
+	err := ir.err
+	ir.err = nil
+
+	return len(ir.buf), ir.err
+}
+
+func (ir *interuptReader) interupt() {
+	ir.mu.Lock()
+	defer ir.mu.Unlock()
+	ir.intr = true
+}
+
+func (ir *interuptReader) run() {
+	buf := make([]byte, 32*1024) // same size io.Copy uses internally
+
+	var intr bool
+	for {
+		ir.mu.Lock()
+		intr = ir.intr
+		ir.intr = false
+		ir.mu.Unlock()
+
+		if intr {
+			ir.readc <- readResult{p:[]byte{}, err: io.EOF}
+			return
+		}
+
+		n, err := ir.Reader.Read(buf)
+		if err != nil {
+			ir.readc <- readResult{p:buf[:n], err: err}
+			return
+		}
+
+		p := make([]byte, n)
+		copy(p, buf[:n])
+		ir.readc <- readResult{p:p, err: nil}
+	}
 }
 
 // This should be >= 512 bytes for DetectContentType,
